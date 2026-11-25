@@ -43,6 +43,13 @@ class FakeIMAP:
     def status(self, f, q):
         return "OK", [f"Trash (MESSAGES {self.trash})".encode()]
 
+    def fetch(self, seqset, query):
+        """通し番号（1始まり・UID昇順）で読む"""
+        self.commands.append(("SEQFETCH", (seqset,)))
+        order = sorted(self.inbox)
+        uids = [order[n - 1] for n in expand(seqset) if 1 <= n <= len(order)]
+        return self.uid("FETCH", ",".join(map(str, uids)), query)
+
     def logout(self):
         return "BYE", [b""]
 

@@ -27,7 +27,8 @@ APP_TITLE = "メール一括整理"
 VERSION = "0.1.0"
 
 SOURCE_FOLDER = "INBOX"
-FETCH_CHUNK = 1000          # 差出人確認のために一度に読むヘッダの件数
+SCAN_CHUNK = 2000           # 受信箱を読み込むとき、一度に読む通数
+RANKING_COUNT = 20
 MAX_UIDSET_LEN = 4000       # 1コマンドに載せるUID指定の最大文字数
 PREVIEW_COUNT = 20
 TIMEOUT_SEC = 60
@@ -138,7 +139,11 @@ def header_fields(raw: bytes):
 
 def classify_from(from_text: str, target: str):
     """From欄を判定 → (対象か, 対象外の理由)"""
-    addrs = [a.strip().lower() for _, a in getaddresses([from_text]) if a.strip()]
+    addrs = tuple(a.strip().lower() for _, a in getaddresses([from_text]) if a.strip())
+    return classify_addrs(addrs, target)
+
+
+def classify_addrs(addrs, target: str):
     if not addrs:
         return False, "差出人を読み取れない"
     if len(addrs) > 1:
@@ -227,6 +232,7 @@ class MailCleaner:
         self.imap = None
         self.caps = set()
         self.log_file = log_file
+        self.index = None          # {UID: (From欄の小文字, アドレスのタプル)}
 
     # 接続 -------------------------------------------------
     def connect(self, host: str, user: str, password: str):
@@ -271,6 +277,7 @@ class MailCleaner:
             except Exception:
                 pass
         self.imap = None
+        self.index = None
 
     # フォルダ ---------------------------------------------
     def list_folders(self):
@@ -300,31 +307,56 @@ class MailCleaner:
                 return f
         return None
 
-    # 検索 -------------------------------------------------
-    def search(self, address: str, progress=None) -> SearchResult:
+    # 受信箱の読み込み -------------------------------------
+    # サーバー側の検索は件数が多いと時間切れになるため、
+    # 差出人欄だけを少しずつ読み込み、アプリの中で検索する
+    def scan_inbox(self, progress=None) -> int:
+        typ, data = self.imap.select(SOURCE_FOLDER)
+        check(typ, data, "受信箱を開く")
+        total = int(data[0]) if data and data[0] else 0
+        index = {}
+        for start in range(1, total + 1, SCAN_CHUNK):
+            end = min(start + SCAN_CHUNK - 1, total)
+            if progress:
+                progress(start - 1, total)
+            fdata = check(*self.imap.fetch(f"{start}:{end}",
+                                           "(UID BODY.PEEK[HEADER.FIELDS (FROM)])"),
+                          "差出人の読み込み")
+            for uid, raw in parse_uid_fetch(fdata).items():
+                from_text = header_fields(raw).get(b"from", "")
+                addrs = tuple(a.strip().lower() for _, a in getaddresses([from_text]) if a.strip())
+                index[uid] = (from_text.lower(), addrs)
+        if progress:
+            progress(total, total)
+        self.index = index
+        return len(index)
+
+    def ranking(self, top=RANKING_COUNT):
+        """差出人（アドレス1つのもの）の通数ランキング"""
+        counter = Counter(addrs[0] for _, addrs in self.index.values()
+                          if len(addrs) == 1 and "@" in addrs[0])
+        return counter.most_common(top)
+
+    # 検索（読み込み済みの差出人から） ---------------------
+    def search(self, address: str) -> SearchResult:
         target = address.strip().lower()
         if "@" not in target or " " in target:
             raise ToolError("メールアドレス全体（@を含む）を入力してください。")
-        check(*self.imap.select(SOURCE_FOLDER), "受信箱を開く")
-        data = check(*self.imap.uid("SEARCH", None, "FROM", quote(target)), "検索")
-        candidates = data[0].split() if data and data[0] else []
-
-        uids, excluded = [], Counter()
-        for i in range(0, len(candidates), FETCH_CHUNK):
-            chunk = candidates[i:i + FETCH_CHUNK]
-            if progress:
-                progress(i, len(candidates))
-            fdata = check(*self.imap.uid("FETCH", compress_uids(chunk),
-                                         "(UID BODY.PEEK[HEADER.FIELDS (FROM)])"),
-                          "差出人の確認")
-            for uid, raw in parse_uid_fetch(fdata).items():
-                ok, reason = classify_from(header_fields(raw).get(b"from", ""), target)
-                if ok:
-                    uids.append(uid)
-                else:
-                    excluded[reason] += 1
+        if self.index is None:
+            raise ToolError("先に受信箱を読み込んでください。")
+        uids, excluded, candidates = [], Counter(), 0
+        for uid, (from_lower, addrs) in self.index.items():
+            if target not in from_lower and target not in addrs:
+                continue
+            candidates += 1
+            ok, reason = classify_addrs(addrs, target)
+            if ok:
+                uids.append(uid)
+            else:
+                excluded[reason] += 1
         uids.sort(key=int)
-        return SearchResult(target, len(candidates), uids, excluded, self.preview(uids))
+        check(*self.imap.select(SOURCE_FOLDER), "受信箱を開く")
+        return SearchResult(target, candidates, uids, excluded, self.preview(uids))
 
     def preview(self, uids, count=PREVIEW_COUNT):
         if not uids:
@@ -366,6 +398,9 @@ class MailCleaner:
             data = check(*self.imap.uid("SEARCH", None, "UID", uid_set), "移動後の確認")
             remaining += len(data[0].split()) if data and data[0] else 0
         result = MoveResult(len(uids), len(uids) - remaining, self.folder_count(trash) - before)
+        if result.ok and self.index is not None:
+            for u in uids:
+                self.index.pop(u, None)
         write_log(address, result.requested, result.removed, result.trash_delta,
                   "OK" if result.ok else "要確認", self.log_file)
         return result

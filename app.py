@@ -31,7 +31,7 @@ class App:
         self.q = queue.Queue()
 
         root.title(f"{core.APP_TITLE}  v{core.VERSION}")
-        root.minsize(760, 720)
+        root.minsize(860, 760)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build()
         self._refresh_state()
@@ -82,15 +82,33 @@ class App:
         self.addr.bind("<Return>", lambda e: self.on_search())
         self.btn_search = ttk.Button(row, text="検索", command=self.on_search)
         self.btn_search.pack(side="left", padx=6)
+        self.btn_scan = ttk.Button(row, text="受信箱を読み込み直す", command=self.on_scan)
+        self.btn_scan.pack(side="right")
         self.search_info = ttk.Label(f3, text="", justify="left")
         self.search_info.pack(fill="x", pady=(6, 2))
+
+        lists = ttk.Frame(f3)
+        lists.pack(fill="both", expand=True)
+        left = ttk.Frame(lists)
+        left.pack(side="left", fill="y")
+        ttk.Label(left, text="通数の多い差出人（クリックで検索）").pack(anchor="w")
+        self.rank = ttk.Treeview(left, columns=("n", "addr"), show="headings", height=9)
+        self.rank.heading("n", text="通数")
+        self.rank.heading("addr", text="差出人")
+        self.rank.column("n", width=70, anchor="e")
+        self.rank.column("addr", width=250, anchor="w")
+        self.rank.pack(fill="y", expand=True)
+        self.rank.bind("<<TreeviewSelect>>", self.on_rank_select)
+
+        right = ttk.Frame(lists)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        ttk.Label(right, text="移動対象の見本（先頭の数件）").pack(anchor="w")
         cols = ("date", "from", "subject")
-        self.tree = ttk.Treeview(f3, columns=cols, show="headings", height=7)
-        for c, label, w in zip(cols, ("日付", "差出人", "件名"), (170, 220, 320)):
+        self.tree = ttk.Treeview(right, columns=cols, show="headings", height=9)
+        for c, label, w in zip(cols, ("日付", "差出人", "件名"), (150, 180, 260)):
             self.tree.heading(c, text=label)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True)
-        ttk.Label(f3, text="↑ 移動対象の見本（先頭の数件）", foreground="#666").pack(anchor="w")
 
         # 4. 移動
         f4 = ttk.LabelFrame(outer, text="4. ゴミ箱へ移す（完全には削除しません）", padding=8)
@@ -128,7 +146,9 @@ class App:
         self.btn_connect.configure(text="ログアウト" if connected else "ログイン",
                                    state="normal" if idle else "disabled")
         self.trash_box.configure(state="readonly" if connected and idle else "disabled")
-        self.btn_search.configure(state="normal" if connected and idle else "disabled")
+        scanned = connected and self.cleaner.index is not None
+        self.btn_search.configure(state="normal" if scanned and idle else "disabled")
+        self.btn_scan.configure(state="normal" if connected and idle else "disabled")
         can_move = connected and idle and self.agree.get() and bool(self.pending) and bool(self.trash_var.get())
         for b in self.btn_moves:
             b.configure(state="normal" if can_move else "disabled")
@@ -138,10 +158,14 @@ class App:
             self.move_info.configure(text="")
 
     # ---------- 裏で動かす仕組み ----------
-    def _run(self, label, work, done):
+    def _run(self, label, work, done, determinate=False):
         self.busy = True
         self.status.configure(text=label)
-        self.progress.start(12)
+        if determinate:
+            self.progress.configure(mode="determinate", maximum=1, value=0)
+        else:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
         self._refresh_state()
 
         def worker():
@@ -155,7 +179,7 @@ class App:
     def _finish(self, done, value, err):
         self.busy = False
         self.progress.stop()
-        self.progress["value"] = 0
+        self.progress.configure(mode="determinate", value=0)
         self.status.configure(text="")
         if err is None:
             done(value)
@@ -168,10 +192,17 @@ class App:
             messagebox.showerror(
                 core.APP_TITLE,
                 "メールサーバーとの接続が切れた可能性があります。\n"
-                "もう一度ログインして、検索からやり直してください。\n"
+                "もう一度ログインしてください（受信箱は自動で読み込み直します）。\n"
                 "ここまでに移したメールはゴミ箱にあります。もう一度検索すれば、"
                 f"受信箱に残っている分だけが対象になります。\n\n（詳細: {type(err).__name__}）")
         self._refresh_state()
+
+    def _report(self, label, done_n, total):
+        """裏の処理から進み具合を画面に伝える"""
+        def update():
+            self.progress.configure(maximum=max(total, 1), value=done_n)
+            self.status.configure(text=f"{label}  {done_n:,} / {total:,} 通")
+        self.q.put(update)
 
     def _poll(self):
         try:
@@ -211,7 +242,43 @@ class App:
             else:
                 self.trash_note.configure(text="ゴミ箱を特定できませんでした。一覧から選んでください。")
             self.status.configure(text="ログインしました。")
+            self.root.after(10, self.on_scan)   # 続けて受信箱を読み込む
         self._run("接続しています...", work, done)
+
+    def on_scan(self):
+        if self.busy or self.cleaner.imap is None:
+            return
+        self._reset_search()
+        label = "受信箱の差出人を読み込んでいます"
+
+        def work():
+            n = self.cleaner.scan_inbox(progress=lambda d, t: self._report(label, d, t))
+            return n, self.cleaner.ranking()
+
+        def done(value):
+            n, top = value
+            self._show_ranking(top)
+            self.status.configure(text=f"受信箱 {n:,} 通の差出人を読み込みました。"
+                                       "差出人を入力するか、左の一覧から選んでください。")
+        self._run(label + "...", work, done, determinate=True)
+
+    def _show_ranking(self, top):
+        self._suppress_rank = True
+        self.rank.delete(*self.rank.get_children())
+        for addr, n in top:
+            self.rank.insert("", "end", values=(f"{n:,}", addr))
+        self._suppress_rank = False
+
+    def on_rank_select(self, _event=None):
+        if getattr(self, "_suppress_rank", False) or self.busy:
+            return
+        sel = self.rank.selection()
+        if not sel:
+            return
+        addr = self.rank.item(sel[0], "values")[1]
+        self.addr.delete(0, "end")
+        self.addr.insert(0, addr)
+        self.on_search()
 
     def on_search(self):
         if self.busy or self.cleaner.imap is None:
@@ -225,8 +292,8 @@ class App:
             self.result = res
             self.pending = list(res.uids)
             self.moved_total = 0
-            lines = [f"サーバーの検索で見つかった件数: {res.candidates} 件",
-                     f"アドレスが完全一致（移動対象）: {len(res.uids)} 件"]
+            lines = [f"差出人欄にこの文字を含むメール: {res.candidates:,} 件",
+                     f"アドレスが完全一致（移動対象）: {len(res.uids):,} 件"]
             if res.excluded:
                 lines.append(f"対象外: {sum(res.excluded.values())} 件（多い順）")
                 for reason, n in res.excluded.most_common(5):
@@ -237,7 +304,7 @@ class App:
                 self.tree.insert("", "end", values=row)
             if len(res.uids) and len(res.uids) <= 100:
                 self.status.configure(text="100件以下なので、Webメールでの操作でも整理できます。")
-        self._run("検索しています（件数が多いと時間がかかります）...", work, done)
+        self._run("検索しています...", work, done)
 
     def _trash_raw(self):
         for f in self.folders:
@@ -262,15 +329,23 @@ class App:
             return
         address = self.result.address
 
-        def work():
-            return self.cleaner.move_batch(address, batch, trash)
+        rest = self.pending[len(batch):]
 
-        def done(r):
+        def work():
+            r = self.cleaner.move_batch(address, batch, trash)
+            return r, (self.cleaner.preview(rest) if r.ok else [])
+
+        def done(value):
+            r, preview = value
+            self.tree.delete(*self.tree.get_children())
+            for row in preview:
+                self.tree.insert("", "end", values=row)
             if r.ok:
                 self.pending = self.pending[len(batch):]
                 self.moved_total += len(batch)
                 self.status.configure(
                     text=f"{len(batch)} 件をゴミ箱へ移し、受信箱から消えたこととゴミ箱の増加を確認しました。")
+                self._show_ranking(self.cleaner.ranking())
                 if not self.pending:
                     messagebox.showinfo(core.APP_TITLE,
                                         f"{address} のメールをすべてゴミ箱へ移しました（{self.moved_total} 件）。")
@@ -282,7 +357,7 @@ class App:
                     f"指示した件数: {r.requested}\n受信箱から消えた件数: {r.removed}\n"
                     f"ゴミ箱で増えた件数: {r.trash_delta}\n\n"
                     "ほかのメールソフトが同時に操作していると起こることがあります。"
-                    "Webメールで受信箱とゴミ箱を確認してから、もう一度検索してください。")
+                    "Webメールで受信箱とゴミ箱を確認してから、「受信箱を読み込み直す」を押して検索し直してください。")
         self._run(f"{len(batch)} 件をゴミ箱へ移しています...", work, done)
 
     def _reset_search(self):
@@ -291,6 +366,7 @@ class App:
         self.moved_total = 0
         self.search_info.configure(text="")
         self.tree.delete(*self.tree.get_children())
+        self._show_ranking([])
 
     def on_close(self):
         if self.busy and not messagebox.askyesno(

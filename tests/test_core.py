@@ -72,9 +72,32 @@ def test_trash_guess(tmp_path):
     assert MailCleaner.guess_trash(folders).raw == "Trash"
 
 
+def test_search_requires_scan(tmp_path):
+    c, _ = cleaner(tmp_path)
+    c.connect("h", "u", "pw")
+    with pytest.raises(ToolError, match="読み込んで"):
+        c.search("news@example.com")
+
+
+def test_scan_in_chunks_and_ranking(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "SCAN_CHUNK", 700)
+    c, fake = cleaner(tmp_path)
+    c.connect("h", "u", "pw")
+    seen = []
+    assert c.scan_inbox(progress=lambda d, t: seen.append((d, t))) == 2505
+    assert seen[0] == (0, 2505) and seen[-1] == (2505, 2505)
+    assert sum(1 for cmd, _ in fake.commands if cmd == "SEQFETCH") == 4
+    # サーバー側の FROM 検索は使わない
+    assert not any(cmd == "SEARCH" and a[1] == "FROM" for cmd, a in fake.commands)
+    top = c.ranking()
+    assert top[0][0] == "news@example.com"
+    assert ("someone@else.jp", 5) in top
+
+
 def test_search_exact_only(tmp_path):
     c, _ = cleaner(tmp_path)
     c.connect("h", "u", "pw")
+    c.scan_inbox()
     res = c.search(" News@Example.com ")
     assert res.candidates == 2500
     multi = sum(1 for i in range(1, 2501) if i % 25 == 1 and i % 10 != 0)
@@ -90,13 +113,17 @@ def test_search_exact_only(tmp_path):
 def test_move_and_verify(tmp_path, caps):
     c, fake = cleaner(tmp_path, caps=caps)
     c.connect("h", "u", "pw")
+    c.scan_inbox()
     res = c.search("news@example.com")
     r1 = c.move_batch(res.address, res.uids[:200], "Trash")
     r2 = c.move_batch(res.address, res.uids[200:1200], "Trash")
     assert r1.ok and r2.ok and fake.trash == 1200
     # 他のメールは巻き込まない
     assert all(u in fake.inbox for u in range(5000, 5005))
-    # 再検索すると残りだけが出る（中断しても続きから）
+    # 移した分は読み込み結果からも外れる
+    assert len(c.search("news@example.com").uids) == len(res.uids) - 1200
+    # 読み込み直しても残りだけが出る（中断しても続きから）
+    c.scan_inbox()
     assert len(c.search("news@example.com").uids) == len(res.uids) - 1200
     log = (tmp_path / "log.csv").read_text(encoding="utf-8-sig").splitlines()
     assert len(log) == 3 and log[1].endswith(",OK")
@@ -107,6 +134,7 @@ def test_move_and_verify(tmp_path, caps):
 def test_mismatch_is_reported(tmp_path):
     c, _ = cleaner(tmp_path, trash_drift=-1)
     c.connect("h", "u", "pw")
+    c.scan_inbox()
     res = c.search("news@example.com")
     r = c.move_batch(res.address, res.uids[:200], "Trash")
     assert not r.ok
